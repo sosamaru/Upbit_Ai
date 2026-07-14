@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from connectors import PaperBroker
 from stock_ai import FEATURE_COLUMNS, AIConfig, StockProfitAI, backtest, build_features
@@ -24,6 +25,24 @@ def sample_frame(rows: int = 500) -> pd.DataFrame:
     )
 
 
+def test_stage2_default_policy_is_safe_and_consistent() -> None:
+    config = AIConfig()
+    config.validate()
+    assert config.trade_mode == "paper"
+    assert config.long_only is True
+    assert config.allow_leverage is False
+    assert config.allow_short is False
+    assert config.max_positions * config.max_position_fraction <= 1 - config.minimum_cash_fraction
+    assert config.max_daily_loss <= config.max_weekly_loss <= config.max_drawdown_limit
+
+
+def test_stage2_policy_rejects_live_or_overallocated_settings() -> None:
+    with pytest.raises(ValueError, match="trade_mode"):
+        AIConfig(trade_mode="live").validate()
+    with pytest.raises(ValueError, match="position limits"):
+        AIConfig(max_positions=4, max_position_fraction=0.20, minimum_cash_fraction=0.30).validate()
+
+
 def test_features_are_complete_after_warmup() -> None:
     features = build_features(sample_frame())
     assert tuple(features.columns) == FEATURE_COLUMNS
@@ -32,7 +51,7 @@ def test_features_are_complete_after_warmup() -> None:
 
 def test_model_training_prediction_and_backtest(tmp_path) -> None:
     frame = sample_frame()
-    config = AIConfig(target_return=0.0, buy_threshold=0.55, sell_threshold=0.45)
+    config = AIConfig(target_return=1e-9, buy_threshold=0.55, sell_threshold=0.45)
     ai = StockProfitAI(config)
     metrics = ai.train(frame)
     assert 0 <= metrics["roc_auc"] <= 1
