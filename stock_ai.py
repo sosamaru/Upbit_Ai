@@ -1,14 +1,14 @@
-"""Core AI, feature engineering, risk management, and backtesting.
+"""Core AI, policy configuration, feature engineering, and backtesting.
 
-This module intentionally keeps the first version compact. External market/broker
-connections live in ``connectors.py`` so the AI core remains testable and replaceable.
+The project stays compact: external market/broker connections live in ``connectors.py``
+while this module owns the validated research policy and AI logic.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import joblib
 import numpy as np
@@ -35,35 +35,97 @@ FEATURE_COLUMNS = (
 
 @dataclass(frozen=True)
 class AIConfig:
-    """Shared configuration for training, prediction, and backtesting."""
+    """Single source of truth for the stage-2 trading objective and risk limits."""
 
+    # Research scope. Live trading is intentionally unavailable before stage 20.
+    trade_mode: str = "paper"
+    market: str = "US_EQUITY"
+    bar_interval: str = "1d"
+    strategy_style: str = "swing"
+    long_only: bool = True
+    allow_leverage: bool = False
+    allow_short: bool = False
+
+    # Prediction objective: seek at least 1% gross return over five daily bars.
     prediction_horizon: int = 5
     target_return: float = 0.01
     buy_threshold: float = 0.60
     sell_threshold: float = 0.45
+    max_holding_bars: int = 10
+
+    # Portfolio and loss limits. These are policy limits; stage 17 builds the full
+    # account-level enforcement engine for daily/weekly losses and multi-asset risk.
+    max_positions: int = 3
+    max_position_fraction: float = 0.20
+    minimum_cash_fraction: float = 0.30
     stop_loss: float = 0.03
     take_profit: float = 0.06
-    max_position_fraction: float = 0.25
+    max_daily_loss: float = 0.02
+    max_weekly_loss: float = 0.05
+    max_drawdown_limit: float = 0.10
+    max_consecutive_losses: int = 3
+
+    # Backtest assumptions.
     fee_rate: float = 0.0005
     slippage_rate: float = 0.0005
     initial_cash: float = 10_000_000.0
     random_state: int = 42
 
     def validate(self) -> None:
-        if self.prediction_horizon < 1:
-            raise ValueError("prediction_horizon must be at least 1")
+        if self.trade_mode not in {"research", "paper"}:
+            raise ValueError("trade_mode must be research or paper before stage 20")
+        if self.market not in {"US_EQUITY", "KR_EQUITY"}:
+            raise ValueError("market must be US_EQUITY or KR_EQUITY")
+        if self.bar_interval not in {"1d", "1h", "30m", "15m"}:
+            raise ValueError("unsupported bar_interval")
+        if self.strategy_style not in {"swing", "position", "intraday"}:
+            raise ValueError("unsupported strategy_style")
+        if not self.long_only or self.allow_leverage or self.allow_short:
+            raise ValueError("stage-2 policy is long-only without leverage or shorting")
+        if self.prediction_horizon < 1 or self.max_holding_bars < 1:
+            raise ValueError("prediction and holding horizons must be at least 1")
+        if self.target_return <= 0:
+            raise ValueError("target_return must be positive")
         if not 0 < self.buy_threshold <= 1:
             raise ValueError("buy_threshold must be in (0, 1]")
         if not 0 <= self.sell_threshold < self.buy_threshold:
             raise ValueError("sell_threshold must be below buy_threshold")
-        for name in ("stop_loss", "take_profit", "max_position_fraction"):
+        if self.max_positions < 1:
+            raise ValueError("max_positions must be at least 1")
+        if self.max_consecutive_losses < 1:
+            raise ValueError("max_consecutive_losses must be at least 1")
+
+        fraction_fields = (
+            "max_position_fraction",
+            "minimum_cash_fraction",
+            "stop_loss",
+            "take_profit",
+            "max_daily_loss",
+            "max_weekly_loss",
+            "max_drawdown_limit",
+        )
+        for name in fraction_fields:
             value = float(getattr(self, name))
-            if not 0 < value <= 1:
-                raise ValueError(f"{name} must be in (0, 1]")
+            if not 0 < value < 1:
+                raise ValueError(f"{name} must be in (0, 1)")
+
+        if self.stop_loss >= self.take_profit:
+            raise ValueError("stop_loss must be below take_profit")
+        if not self.max_daily_loss <= self.max_weekly_loss <= self.max_drawdown_limit:
+            raise ValueError("loss limits must satisfy daily <= weekly <= drawdown")
+        deployable_fraction = 1 - self.minimum_cash_fraction
+        if self.max_positions * self.max_position_fraction > deployable_fraction + 1e-12:
+            raise ValueError("position limits exceed capital available after cash reserve")
         if self.fee_rate < 0 or self.slippage_rate < 0:
             raise ValueError("trading costs cannot be negative")
         if self.initial_cash <= 0:
             raise ValueError("initial_cash must be positive")
+
+    def policy_summary(self) -> dict[str, Any]:
+        """Return the fixed stage-2 policy in a serializable form."""
+
+        self.validate()
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -115,7 +177,7 @@ def validate_ohlcv(frame: pd.DataFrame) -> pd.DataFrame:
     if (normalized["low"] > normalized[["open", "close", "high"]].min(axis=1)).any():
         raise ValueError("low price is inconsistent")
 
-    return normalized.astype(float)
+    return cast(pd.DataFrame, normalized.astype(float))
 
 
 def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -253,12 +315,10 @@ class StockProfitAI:
         self._require_fitted()
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(
-            {"config": asdict(self.config), "model": self.model}, destination
-        )
+        joblib.dump({"config": asdict(self.config), "model": self.model}, destination)
 
     @classmethod
-    def load(cls, path: str | Path) -> StockProfitAI:
+    def load(cls, path: str | Path) -> "StockProfitAI":
         payload: dict[str, Any] = joblib.load(Path(path))
         instance = cls(AIConfig(**payload["config"]))
         instance.model = payload["model"]
@@ -282,7 +342,7 @@ def backtest(
     probabilities: pd.Series,
     config: AIConfig,
 ) -> BacktestResult:
-    """Run a long-only simulation with next-bar execution and fixed risk limits."""
+    """Run a long-only simulation with next-bar execution and stage-2 limits."""
 
     config.validate()
     data = validate_ohlcv(frame)
@@ -290,6 +350,7 @@ def backtest(
     cash = config.initial_cash
     quantity = 0.0
     entry_price = 0.0
+    holding_bars = 0
     trades: list[float] = []
     equity_curve: list[float] = []
     trading_cost = config.fee_rate + config.slippage_rate
@@ -297,13 +358,16 @@ def backtest(
     for timestamp, row in data.iterrows():
         open_price = float(row["open"])
         close_price = float(row["close"])
-        probability = aligned_probability.loc[timestamp]
+        probability_raw = aligned_probability.reindex([timestamp]).iloc[0]
+        probability = float(probability_raw) if pd.notna(probability_raw) else np.nan
 
         if quantity > 0:
+            holding_bars += 1
             return_from_entry = close_price / entry_price - 1
             should_exit = (
                 return_from_entry <= -config.stop_loss
                 or return_from_entry >= config.take_profit
+                or holding_bars >= config.max_holding_bars
                 or (pd.notna(probability) and probability <= config.sell_threshold)
             )
             if should_exit:
@@ -314,6 +378,7 @@ def backtest(
                 cash += proceeds
                 quantity = 0.0
                 entry_price = 0.0
+                holding_bars = 0
 
         if (
             quantity == 0
@@ -326,6 +391,7 @@ def backtest(
             spent = quantity * buy_price * (1 + config.fee_rate)
             cash -= spent
             entry_price = buy_price
+            holding_bars = 0
 
         equity_curve.append(cash + quantity * close_price * (1 - trading_cost))
 
