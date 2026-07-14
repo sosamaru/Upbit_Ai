@@ -1,4 +1,4 @@
-"""Command-line entry point for data download, training, prediction, and backtesting."""
+"""Command-line entry point for configuration, data, training, and backtesting."""
 
 from __future__ import annotations
 
@@ -14,26 +14,51 @@ from connectors import CSVMarketData, YFinanceMarketData
 from stock_ai import AIConfig, StockProfitAI, backtest
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "true" if default else "false").strip().lower()
+    if raw not in {"true", "false", "1", "0", "yes", "no"}:
+        raise ValueError(f"{name} must be a boolean")
+    return raw in {"true", "1", "yes"}
+
+
 def load_config() -> AIConfig:
     load_dotenv()
-    return AIConfig(
+    config = AIConfig(
+        trade_mode=os.getenv("AI_TRADE_MODE", "paper"),
+        market=os.getenv("AI_MARKET", "US_EQUITY"),
+        bar_interval=os.getenv("AI_BAR_INTERVAL", "1d"),
+        strategy_style=os.getenv("AI_STRATEGY_STYLE", "swing"),
+        long_only=_env_bool("AI_LONG_ONLY", True),
+        allow_leverage=_env_bool("AI_ALLOW_LEVERAGE", False),
+        allow_short=_env_bool("AI_ALLOW_SHORT", False),
         prediction_horizon=int(os.getenv("AI_PREDICTION_HORIZON", "5")),
         target_return=float(os.getenv("AI_TARGET_RETURN", "0.01")),
         buy_threshold=float(os.getenv("AI_BUY_THRESHOLD", "0.60")),
         sell_threshold=float(os.getenv("AI_SELL_THRESHOLD", "0.45")),
+        max_holding_bars=int(os.getenv("AI_MAX_HOLDING_BARS", "10")),
+        max_positions=int(os.getenv("AI_MAX_POSITIONS", "3")),
+        max_position_fraction=float(os.getenv("AI_MAX_POSITION_FRACTION", "0.20")),
+        minimum_cash_fraction=float(os.getenv("AI_MINIMUM_CASH_FRACTION", "0.30")),
         stop_loss=float(os.getenv("AI_STOP_LOSS", "0.03")),
         take_profit=float(os.getenv("AI_TAKE_PROFIT", "0.06")),
-        max_position_fraction=float(os.getenv("AI_MAX_POSITION_FRACTION", "0.25")),
+        max_daily_loss=float(os.getenv("AI_MAX_DAILY_LOSS", "0.02")),
+        max_weekly_loss=float(os.getenv("AI_MAX_WEEKLY_LOSS", "0.05")),
+        max_drawdown_limit=float(os.getenv("AI_MAX_DRAWDOWN_LIMIT", "0.10")),
+        max_consecutive_losses=int(os.getenv("AI_MAX_CONSECUTIVE_LOSSES", "3")),
         fee_rate=float(os.getenv("AI_FEE_RATE", "0.0005")),
         slippage_rate=float(os.getenv("AI_SLIPPAGE_RATE", "0.0005")),
         initial_cash=float(os.getenv("AI_INITIAL_CASH", "10000000")),
         random_state=int(os.getenv("AI_RANDOM_STATE", "42")),
     )
+    config.validate()
+    return config
 
 
 def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(description="Stock Profit Maximizer AI")
     subcommands = command.add_subparsers(dest="command", required=True)
+
+    subcommands.add_parser("config", help="validate and print the fixed trading policy")
 
     download = subcommands.add_parser("download", help="download public research data")
     download.add_argument("--symbol", required=True)
@@ -59,6 +84,10 @@ def parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = parser().parse_args()
     config = load_config()
+
+    if args.command == "config":
+        print(json.dumps(config.policy_summary(), ensure_ascii=False, indent=2))
+        return
 
     if args.command == "download":
         frame = YFinanceMarketData().fetch(args.symbol, args.start, args.end)
