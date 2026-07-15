@@ -11,6 +11,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from connectors import CSVMarketData, YFinanceMarketData
+from market_data import MarketDataCollector, verify_dataset
 from stock_ai import AIConfig, StockProfitAI, backtest
 
 
@@ -60,11 +61,20 @@ def parser() -> argparse.ArgumentParser:
 
     subcommands.add_parser("config", help="validate and print the fixed trading policy")
 
-    download = subcommands.add_parser("download", help="download public research data")
+    download = subcommands.add_parser("download", help="download one public research CSV")
     download.add_argument("--symbol", required=True)
     download.add_argument("--start", required=True)
     download.add_argument("--end", required=True)
     download.add_argument("--output", default="data.csv")
+
+    collect = subcommands.add_parser("collect", help="collect a versioned multi-symbol dataset")
+    collect.add_argument("--symbols", nargs="+", required=True)
+    collect.add_argument("--start", required=True)
+    collect.add_argument("--end", required=True)
+    collect.add_argument("--output-dir", default="data/raw")
+
+    verify = subcommands.add_parser("verify-data", help="verify a dataset manifest and checksums")
+    verify.add_argument("--manifest", required=True)
 
     train = subcommands.add_parser("train", help="train and save a model")
     train.add_argument("--data", required=True)
@@ -88,7 +98,6 @@ def main() -> None:
     if args.command == "config":
         print(json.dumps(config.policy_summary(), ensure_ascii=False, indent=2))
         return
-
     if args.command == "download":
         frame = YFinanceMarketData().fetch(args.symbol, args.start, args.end)
         destination = Path(args.output)
@@ -96,9 +105,29 @@ def main() -> None:
         frame.to_csv(destination)
         print(json.dumps({"rows": len(frame), "output": str(destination)}, ensure_ascii=False))
         return
+    if args.command == "collect":
+        collector = MarketDataCollector(
+            provider=YFinanceMarketData(),
+            source_name="yfinance",
+            root_dir=args.output_dir,
+            interval=config.bar_interval,
+            adjusted=False,
+        )
+        result = collector.collect(args.symbols, args.start, args.end)
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
+    if args.command == "verify-data":
+        records = verify_dataset(args.manifest)
+        print(
+            json.dumps(
+                {"verified": len(records), "symbols": [record.symbol for record in records]},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
 
     frame = CSVMarketData(args.data).fetch()
-
     if args.command == "train":
         ai = StockProfitAI(config)
         metrics = ai.train(frame)
